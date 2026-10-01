@@ -576,6 +576,7 @@ class GiveawayView(discord.ui.View):
 @bot.event
 async def on_ready():
     global license_api_runner
+    honeypot.start_recovery(bot, log_event, DB_PATH)
     bot.add_view(TicketView())
     bot.add_view(RulesView())
     if license_api_runner is None:
@@ -600,7 +601,7 @@ async def on_message(message: discord.Message):
     if message.author.bot or not message.guild:
         return
 
-    if await honeypot.handle_message(message, log_event, DEFAULT_GUILD_ID):
+    if await honeypot.handle_message(message, log_event, DEFAULT_GUILD_ID, DB_PATH):
         return
 
     # Automatic Discord -> website vouch sync for one configured review channel.
