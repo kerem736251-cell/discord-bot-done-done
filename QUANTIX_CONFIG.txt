@@ -1,0 +1,20 @@
+Quantix Discord Bot - Preconfigured IDs
+=======================================
+Application ID: 1543611306605543505
+Server ID:      1539742147371081738
+
+Channels
+Welcome:        1543764186096730184
+Primary Logs:   1543764495292432445
+Extra Logs #1:  1543764497456431146
+Extra Logs #2:  1543764499591602338
+Ticket Panel:   1543764410483351567
+
+Roles
+Support:        1543764175132819478
+Pro:            1543764180648075264
+Elite:          1543764178379210802
+
+IMPORTANT: Do not put the old exposed bot token in these files.
+Regenerate it in Discord Developer Portal, then add the NEW token as
+DISCORD_TOKEN in the host's environment/variables section.
