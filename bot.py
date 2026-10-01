@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 from quantix_licensing import normalize_hwid
 import license_registry as registry
 import manager_sync
+import honeypot
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN", "")
@@ -597,6 +598,9 @@ async def on_ready():
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot or not message.guild:
+        return
+
+    if await honeypot.handle_message(message, log_event, DEFAULT_GUILD_ID):
         return
 
     # Automatic Discord -> website vouch sync for one configured review channel.

@@ -63,3 +63,8 @@ The QTX2 integration replaces the V2.4 random-code generator with the existing P
 ## Desktop manager synchronization
 
 Updated Pro and Elite managers synchronize signed licenses and revoke/restore/delete state every 30 seconds while open. The HTTPS endpoint `/api/manager/sync/{tier}` authenticates edition-specific signed requests with short-lived timestamps and one-use nonces. Version checks prevent stale desktop restores. No signing private key is transmitted by the managers. Existing JSON databases are preserved and backed up before first merge.
+
+## Honeypot moderation
+
+Human messages in a text channel named exactly honeypot (case-insensitive) trigger a DM with https://discord.gg/quantix, followed by a kick. The configured GUILD_ID limits the rule to that server. Bot/webhook/system messages are ignored. The server owner and members at or above the bot's highest role cannot be kicked. The bot requires View Channel and Kick Members. Closed DMs do not prevent the kick; delivery and kick failures go to the configured moderation log. Existing messages are not scanned. No additional Railway variables are required.
+
