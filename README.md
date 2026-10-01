@@ -44,7 +44,7 @@ Use OAuth2 scopes `bot` and `applications.commands`. Give the bot permissions ne
 3. Add `DISCORD_TOKEN` as an environment variable.
 4. Deploy one replica with sleeping disabled.
 
-The bot does not need a public web domain; it connects outbound to Discord.
+The bot connects outbound to Discord. Two-way desktop license-manager sync additionally uses the HTTPS service domain.
 
 ## V2.3 — persistent Rules verification
 - `/rulespanel` posts the Quantix rules panel with a persistent **I agree — verify me** button.
@@ -58,4 +58,8 @@ The bot does not need a public web domain; it connects outbound to Discord.
 
 ## V2.4 — Discord License Key Management
 
-V2.4 adds Staff-only Utility license management (`/key create`, `/key info`, `/key revoke`, `/key extend`, `/key reset-hwid`, `/keys user`) and a built-in validation API for the Quantix Utility. See **LICENSE_KEY_SETUP.md** before creating production keys. For Railway, mount a Volume at `/data` and set `DB_PATH=/data/quantix.db` so licenses survive redeploys.
+The QTX2 integration replaces the V2.4 random-code generator with the existing Pro/Elite utility's signed offline license format. Create, extend and reset-HWID issue a signed key and DM it after database registration. Resend and signed revocation import/export commands are included. Existing utilities validate these keys offline; database revocation alone cannot remotely disable them. See **LICENSE_KEY_SETUP.md** for signing-key variables, migration, tests and deployment. For Railway, mount a Volume at `/data` and set `DB_PATH=/data/quantix.db` so licenses survive redeploys.
+
+## Desktop manager synchronization
+
+Updated Pro and Elite managers synchronize signed licenses and revoke/restore/delete state every 30 seconds while open. The HTTPS endpoint `/api/manager/sync/{tier}` authenticates edition-specific signed requests with short-lived timestamps and one-use nonces. Version checks prevent stale desktop restores. No signing private key is transmitted by the managers. Existing JSON databases are preserved and backed up before first merge.

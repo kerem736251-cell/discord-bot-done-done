@@ -1,0 +1,12 @@
+.env
+.env.*
+!.env.example
+*.db
+*.db-*
+*.sqlite*
+*.key
+*.qrv
+*-private.pem
+__pycache__/
+*.pyc
+.venv/

@@ -1,0 +1,13 @@
+.git
+.env
+.env.*
+*.db
+*.db-*
+*.sqlite*
+*.key
+*.qrv
+**/*-private.pem
+__pycache__
+*.pyc
+.venv
+tests

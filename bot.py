@@ -4,6 +4,9 @@ import secrets
 import sqlite3
 import asyncio
 import re
+import io
+from pathlib import Path
+from contextlib import closing
 from datetime import timedelta, datetime, timezone
 from typing import Optional
 
@@ -13,6 +16,9 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
+from quantix_licensing import normalize_hwid
+import license_registry as registry
+import manager_sync
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN", "")
@@ -41,12 +47,17 @@ LICENSE_API_PORT = int(os.getenv("PORT", "8080") or 8080)
 
 
 def db():
+    Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
     return con
 
 
 def init_db():
+    # Preserve an online-consistent copy before the first QTX2 schema migration.
+    if Path(DB_PATH).is_file() and not Path(DB_PATH + ".before-qtx2").exists():
+        with closing(sqlite3.connect(DB_PATH)) as source, closing(sqlite3.connect(DB_PATH + ".before-qtx2")) as backup:
+            source.backup(backup)
     con = db()
     con.executescript(
         """
@@ -106,6 +117,7 @@ def init_db():
     columns = {row[1] for row in con.execute("PRAGMA table_info(tickets)").fetchall()}
     if "ticket_type" not in columns:
         con.execute("ALTER TABLE tickets ADD COLUMN ticket_type TEXT DEFAULT 'support'")
+    registry.migrate(con)
     con.commit()
     con.close()
 
@@ -262,11 +274,6 @@ def parse_iso(value):
         return None
 
 
-def make_license_key(tier: str):
-    prefix = "ELITE" if tier == "elite" else "PRO"
-    return f"QTX-{prefix}-{secrets.token_hex(3).upper()}-{secrets.token_hex(3).upper()}"
-
-
 def license_status(row):
     if not row:
         return "invalid"
@@ -292,7 +299,9 @@ async def license_validate_request(request: web.Request):
     except Exception:
         return web.json_response({"ok": False, "error": "invalid_json"}, status=400)
 
-    key = str(body.get("key", "")).strip().upper()
+    if not isinstance(body, dict):
+        return web.json_response({"ok": False, "error": "invalid_json"}, status=400)
+    key = registry.normalize_key(str(body.get("key", "")))
     hwid = str(body.get("hwid", "")).strip()
     if not key or not hwid:
         return web.json_response({"ok": False, "error": "key_and_hwid_required"}, status=400)
@@ -303,6 +312,11 @@ async def license_validate_request(request: web.Request):
     status = license_status(row)
     if status != "active":
         return web.json_response({"ok": False, "status": status}, status=403)
+    if row["license_id"]:
+        try:
+            hwid = normalize_hwid(hwid)
+        except ValueError:
+            return web.json_response({"ok": False, "status": "hwid_mismatch"}, status=403)
     if hwid != row["hwid"]:
         return web.json_response({"ok": False, "status": "hwid_mismatch"}, status=403)
 
@@ -321,15 +335,32 @@ async def license_health_request(request: web.Request):
 
 
 async def start_license_api():
-    app = web.Application()
+    app = web.Application(client_max_size=17_000_000)
     app.router.add_get("/health", license_health_request)
     app.router.add_post("/api/license/validate", license_validate_request)
+    app.router.add_post("/api/manager/sync/{tier}", manager_sync_request)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", LICENSE_API_PORT)
     await site.start()
     print(f"License API listening on port {LICENSE_API_PORT}")
     return runner
+
+
+async def manager_sync_request(request: web.Request):
+    tier = request.match_info["tier"]
+    if tier not in ("pro", "elite"):
+        return web.json_response({"error": "invalid_edition"}, status=400)
+    try:
+        data = await request.json()
+        if not isinstance(data, dict) or not isinstance(data.get("request"), str):
+            raise ValueError()
+        with closing(db()) as con, con:
+            con.execute("BEGIN IMMEDIATE")
+            result = manager_sync.synchronize(con, tier, data["request"])
+        return web.json_response(result, headers={"Cache-Control": "no-store"})
+    except (ValueError, TypeError):
+        return web.json_response({"error": "invalid_sync_request_or_conflict"}, status=401)
 
 
 TICKET_TYPES = {
@@ -741,173 +772,221 @@ key_group = app_commands.Group(name="key", description="Manage Quantix utility l
 keys_group = app_commands.Group(name="keys", description="List Quantix utility licenses")
 
 
+async def require_license_staff(interaction):
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message("Server only.", ephemeral=True)
+        return False
+    if not is_staff(interaction.user):
+        await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+        return False
+    return True
+
+
+def license_attachment(row):
+    return discord.File(io.BytesIO(row["license_key"].encode("utf-8")),
+                        filename=f"Quantix-{row['tier']}-{row['license_id'] or 'legacy'}.key")
+
+
+async def deliver_license(interaction, row, customer=None):
+    # Registration has committed before contacting Discord. Delivery can be retried.
+    em = quantix_embed(f"🔑 Quantix {row['tier'].title()} License",
+                       "Open the attached .key file and paste its entire contents into Quantix. Keep it private.", success=True)
+    em.add_field(name="License ID", value=row["license_id"] or "Legacy", inline=False)
+    em.add_field(name="HWID", value=row["hwid"], inline=False)
+    exp = parse_iso(row["expires_at"])
+    em.add_field(name="Expires", value=f"<t:{int(exp.timestamp())}:F>" if exp else "Permanent", inline=False)
+    if len(row["license_key"]) <= 1000:
+        em.add_field(name="License key", value=f"`{row['license_key']}`", inline=False)
+    try:
+        customer = customer or await bot.fetch_user(row["discord_user_id"])
+        await customer.send(embed=em, file=license_attachment(row))
+    except discord.HTTPException:
+        await interaction.followup.send(
+            f"✅ License saved. DM delivery failed. Deliver this private attachment to the customer, or use /key resend with ID `{row['license_id']}`.",
+            file=license_attachment(row), ephemeral=True)
+        return
+    await interaction.followup.send(f"✅ License saved and sent by DM. ID: `{row['license_id']}`", ephemeral=True)
+
+
 @key_group.command(name="create", description="Create a Pro/Elite license and DM it to a customer")
 @app_commands.choices(
-    tier=[
-        app_commands.Choice(name="Pro", value="pro"),
-        app_commands.Choice(name="Elite", value="elite"),
-    ],
+    tier=[app_commands.Choice(name="Pro", value="pro"), app_commands.Choice(name="Elite", value="elite")],
     duration=[
         app_commands.Choice(name="1 Day", value="1d"),
         app_commands.Choice(name="1 Week", value="1w"),
-        app_commands.Choice(name="1 Month", value="1m"),
-        app_commands.Choice(name="1 Year", value="1y"),
+        app_commands.Choice(name="1 Month (30 days)", value="1m"),
+        app_commands.Choice(name="1 Year (365 days)", value="1y"),
         app_commands.Choice(name="Permanent", value="permanent"),
     ],
 )
-async def key_create(
-    interaction: discord.Interaction,
-    customer: discord.Member,
-    tier: app_commands.Choice[str],
-    hwid: str,
-    duration: app_commands.Choice[str],
-):
-    if not interaction.guild or not isinstance(interaction.user, discord.Member):
-        return await interaction.response.send_message("Server only.", ephemeral=True)
-    if not is_staff(interaction.user):
-        return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
-    hwid = hwid.strip()
-    if len(hwid) < 4 or len(hwid) > 300:
-        return await interaction.response.send_message("❌ Please enter a valid HWID.", ephemeral=True)
-
+async def key_create(interaction: discord.Interaction, customer: discord.Member,
+                     tier: app_commands.Choice[str], hwid: str, duration: app_commands.Choice[str]):
+    if not await require_license_staff(interaction):
+        return
     await interaction.response.defer(ephemeral=True)
     label, delta = LICENSE_DURATIONS[duration.value]
     created = utcnow()
     expires = created + delta if delta else None
-    key = make_license_key(tier.value)
-    con = db()
-    con.execute(
-        "INSERT INTO licenses(license_key,tier,hwid,discord_user_id,created_by,created_at,expires_at) VALUES(?,?,?,?,?,?,?)",
-        (key, tier.value, hwid, customer.id, interaction.user.id, iso(created), iso(expires)),
-    )
-    con.commit(); con.close()
-
-    dm = quantix_embed(
-        f"🔑 Quantix {tier.name} License",
-        "Your Quantix license has been created. Keep this key private.",
-        success=True,
-    )
-    dm.add_field(name="License Key", value=f"`{key}`", inline=False)
-    dm.add_field(name="Duration", value=label, inline=True)
-    dm.add_field(name="HWID", value=f"`{hwid}`", inline=False)
-    dm.add_field(name="Expires", value=(f"<t:{int(expires.timestamp())}:F>" if expires else "Permanent"), inline=False)
-    dm.set_footer(text="Quantix • Do not share your license key")
-
-    dm_ok = True
     try:
-        await customer.send(embed=dm)
-    except discord.HTTPException:
-        dm_ok = False
-
-    await interaction.followup.send(
-        f"✅ **{tier.name}** key created for {customer.mention} • **{label}**\n"
-        + ("📩 Sent by DM." if dm_ok else "⚠️ Key created, but the customer's DMs are closed."),
-        ephemeral=True,
-    )
+        with closing(db()) as con, con:
+            row = registry.insert_license(con, tier.value, str(customer), customer.id, hwid,
+                                          expires, interaction.user.id, created)
+    except ValueError as exc:
+        return await interaction.followup.send(f"❌ {exc}", ephemeral=True)
+    await deliver_license(interaction, row, customer)
     await log_event(interaction.guild, f"🔑 {tier.name} key created for {customer.mention} • {label} • by {interaction.user.mention}")
 
 
-@key_group.command(name="info", description="Show license status without exposing the full key publicly")
+@key_group.command(name="info", description="Show license status; enter a full key or license ID")
 async def key_info(interaction: discord.Interaction, license_key: str):
-    if not interaction.guild or not isinstance(interaction.user, discord.Member):
-        return await interaction.response.send_message("Server only.", ephemeral=True)
-    if not is_staff(interaction.user):
-        return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
-    key = license_key.strip().upper()
-    con = db(); row = con.execute("SELECT * FROM licenses WHERE license_key=?", (key,)).fetchone(); con.close()
+    if not await require_license_staff(interaction):
+        return
+    with closing(db()) as con:
+        row = registry.lookup(con, license_key)
     if not row:
         return await interaction.response.send_message("❌ License not found.", ephemeral=True)
     status = license_status(row)
     exp = parse_iso(row["expires_at"])
-    masked = key[:9] + "••••••" + key[-4:]
     em = quantix_embed("Quantix License", success=(status == "active"))
-    em.add_field(name="Key", value=f"`{masked}`", inline=False)
+    em.add_field(name="License ID", value=row["license_id"] or "Legacy API-only key — reissue required", inline=False)
     em.add_field(name="Tier", value=row["tier"].title(), inline=True)
-    em.add_field(name="Status", value=status.title(), inline=True)
+    em.add_field(name="Registry status", value=status.title(), inline=True)
     em.add_field(name="Customer", value=f"<@{row['discord_user_id']}>", inline=True)
-    em.add_field(name="HWID", value=f"`{row['hwid']}`", inline=False)
-    em.add_field(name="Expires", value=(f"<t:{int(exp.timestamp())}:F>" if exp else "Permanent"), inline=False)
+    em.add_field(name="HWID", value=row["hwid"], inline=False)
+    em.add_field(name="Expires", value=f"<t:{int(exp.timestamp())}:F>" if exp else "Permanent", inline=False)
+    if row["replaced_by"]:
+        em.add_field(name="Replacement ID", value=row["replaced_by"], inline=False)
+    em.add_field(name="Offline utility", value="Revocations require importing a signed .qrv update on the customer PC.", inline=False)
     await interaction.response.send_message(embed=em, ephemeral=True)
 
 
-@key_group.command(name="revoke", description="Revoke a Quantix license immediately")
+@key_group.command(name="revoke", description="Revoke in the registry; offline apps need a signed update")
 async def key_revoke(interaction: discord.Interaction, license_key: str):
-    if not interaction.guild or not isinstance(interaction.user, discord.Member):
-        return await interaction.response.send_message("Server only.", ephemeral=True)
-    if not is_staff(interaction.user):
-        return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
-    key = license_key.strip().upper()
-    con = db(); row = con.execute("SELECT * FROM licenses WHERE license_key=?", (key,)).fetchone()
-    if not row:
-        con.close(); return await interaction.response.send_message("❌ License not found.", ephemeral=True)
-    con.execute("UPDATE licenses SET revoked=1, revoked_at=?, revoked_by=? WHERE license_key=?", (iso(utcnow()), interaction.user.id, key))
-    con.commit(); con.close()
-    await interaction.response.send_message("✅ License revoked.", ephemeral=True)
+    if not await require_license_staff(interaction):
+        return
+    try:
+        with closing(db()) as con, con:
+            row = registry.revoke(con, license_key, interaction.user.id)
+    except ValueError as exc:
+        return await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
+    await interaction.response.send_message(
+        "✅ Revoked in the bot/API. Offline utilities still accept the old key until the matching /key export-update file is imported on that PC.", ephemeral=True)
     await log_event(interaction.guild, f"🚫 License revoked for <@{row['discord_user_id']}> by {interaction.user.mention}")
 
 
-@key_group.command(name="reset-hwid", description="Replace the HWID bound to an existing license")
+@key_group.command(name="reset-hwid", description="Issue a replacement signed key for a new HWID and DM it")
 async def key_reset_hwid(interaction: discord.Interaction, license_key: str, new_hwid: str):
-    if not interaction.guild or not isinstance(interaction.user, discord.Member):
-        return await interaction.response.send_message("Server only.", ephemeral=True)
-    if not is_staff(interaction.user):
-        return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
-    key = license_key.strip().upper(); new_hwid = new_hwid.strip()
-    if len(new_hwid) < 4 or len(new_hwid) > 300:
-        return await interaction.response.send_message("❌ Please enter a valid HWID.", ephemeral=True)
-    con = db(); row = con.execute("SELECT * FROM licenses WHERE license_key=?", (key,)).fetchone()
-    if not row:
-        con.close(); return await interaction.response.send_message("❌ License not found.", ephemeral=True)
-    con.execute("UPDATE licenses SET hwid=? WHERE license_key=?", (new_hwid, key)); con.commit(); con.close()
-    await interaction.response.send_message("✅ HWID updated.", ephemeral=True)
+    if not await require_license_staff(interaction):
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        with closing(db()) as con, con:
+            con.execute("BEGIN IMMEDIATE")
+            old = registry.lookup(con, license_key)
+            if not old:
+                raise ValueError("License not found.")
+            if old["revoked"]:
+                raise ValueError("Cannot reset a revoked license. Create an authorized replacement instead.")
+            row = registry.replace_license(con, license_key, new_hwid, parse_iso(old["expires_at"]), interaction.user.id)
+    except ValueError as exc:
+        return await interaction.followup.send(f"❌ {exc}", ephemeral=True)
+    await deliver_license(interaction, row)
+    await interaction.followup.send("The old key is revoked in the registry. Import /key export-update on the old PC to revoke it there too.", ephemeral=True)
     await log_event(interaction.guild, f"🖥️ HWID changed for <@{row['discord_user_id']}> by {interaction.user.mention}")
 
 
-@key_group.command(name="extend", description="Extend or make a license permanent")
+@key_group.command(name="extend", description="Issue and DM a replacement key with a longer validity")
 @app_commands.choices(duration=[
     app_commands.Choice(name="+1 Day", value="1d"),
     app_commands.Choice(name="+1 Week", value="1w"),
-    app_commands.Choice(name="+1 Month", value="1m"),
-    app_commands.Choice(name="+1 Year", value="1y"),
+    app_commands.Choice(name="+1 Month (30 days)", value="1m"),
+    app_commands.Choice(name="+1 Year (365 days)", value="1y"),
     app_commands.Choice(name="Make Permanent", value="permanent"),
 ])
 async def key_extend(interaction: discord.Interaction, license_key: str, duration: app_commands.Choice[str]):
-    if not interaction.guild or not isinstance(interaction.user, discord.Member):
-        return await interaction.response.send_message("Server only.", ephemeral=True)
-    if not is_staff(interaction.user):
-        return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
-    key = license_key.strip().upper()
-    con = db(); row = con.execute("SELECT * FROM licenses WHERE license_key=?", (key,)).fetchone()
-    if not row:
-        con.close(); return await interaction.response.send_message("❌ License not found.", ephemeral=True)
+    if not await require_license_staff(interaction):
+        return
+    await interaction.response.defer(ephemeral=True)
     label, delta = LICENSE_DURATIONS[duration.value]
-    if delta is None:
-        new_exp = None
-    else:
-        current_exp = parse_iso(row["expires_at"])
-        base = current_exp if current_exp and current_exp > utcnow() else utcnow()
-        new_exp = base + delta
-    con.execute("UPDATE licenses SET expires_at=?, revoked=0, revoked_at=NULL, revoked_by=0 WHERE license_key=?", (iso(new_exp), key))
-    con.commit(); con.close()
-    await interaction.response.send_message(f"✅ License updated: **{label}**.", ephemeral=True)
+    try:
+        with closing(db()) as con, con:
+            con.execute("BEGIN IMMEDIATE")
+            old = registry.lookup(con, license_key)
+            if not old:
+                raise ValueError("License not found.")
+            current = parse_iso(old["expires_at"])
+            # Never shorten an existing permanent license when staff choose +days.
+            expires = max(current, utcnow()) + delta if current and delta else None
+            row = registry.replace_license(con, license_key, old["hwid"], expires, interaction.user.id)
+    except ValueError as exc:
+        return await interaction.followup.send(f"❌ {exc}", ephemeral=True)
+    await deliver_license(interaction, row)
+    await interaction.followup.send("Activate the replacement key to use the new expiry. The old key remains usable offline until its expiry or an imported revocation update.", ephemeral=True)
     await log_event(interaction.guild, f"⏱️ License extended for <@{row['discord_user_id']}> • {label} • by {interaction.user.mention}")
+
+
+@key_group.command(name="resend", description="Retry private delivery of an active license by key or ID")
+async def key_resend(interaction: discord.Interaction, license_key: str):
+    if not await require_license_staff(interaction):
+        return
+    await interaction.response.defer(ephemeral=True)
+    with closing(db()) as con:
+        row = registry.lookup(con, license_key)
+    if license_status(row) != "active" or not row["license_id"]:
+        return await interaction.followup.send("❌ An active QTX2 license is required.", ephemeral=True)
+    await deliver_license(interaction, row)
+
+
+@key_group.command(name="export-update", description="Export this registry's offline revocations for an edition")
+@app_commands.choices(tier=[app_commands.Choice(name="Pro", value="pro"), app_commands.Choice(name="Elite", value="elite")])
+async def key_export_update(interaction: discord.Interaction, tier: app_commands.Choice[str]):
+    if not await require_license_staff(interaction):
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        with closing(db()) as con, con:
+            con.execute("BEGIN IMMEDIATE")
+            manifest = registry.export_update(con, tier.value)
+    except ValueError as exc:
+        return await interaction.followup.send(f"❌ {exc}", ephemeral=True)
+    await interaction.followup.send(
+        "Import this file using LICENSE UPDATE in the matching utility. Before distributing it, merge any desktop manager's exported .qrv using /key import-update. Use this bot as the single publisher of cumulative updates.",
+        file=discord.File(io.BytesIO(manifest.encode("utf-8")), filename=f"quantix-{tier.value}.qrv"), ephemeral=True)
+
+
+@key_group.command(name="import-update", description="Merge a desktop manager's signed offline revocations")
+@app_commands.choices(tier=[app_commands.Choice(name="Pro", value="pro"), app_commands.Choice(name="Elite", value="elite")])
+async def key_import_update(interaction: discord.Interaction, tier: app_commands.Choice[str], update: discord.Attachment):
+    if not await require_license_staff(interaction):
+        return
+    await interaction.response.defer(ephemeral=True)
+    if update.size > 2_000_000:
+        return await interaction.followup.send("❌ Update is too large.", ephemeral=True)
+    try:
+        token = (await update.read()).decode("utf-8-sig")
+        with closing(db()) as con, con:
+            con.execute("BEGIN IMMEDIATE")
+            count = registry.import_update(con, token, tier.value)
+    except ValueError as exc:
+        return await interaction.followup.send("❌ Invalid signed update or wrong edition.", ephemeral=True)
+    await interaction.followup.send(
+        f"✅ Merged {count} revocation IDs. Existing revocations were retained. Export a new cumulative update with /key export-update. Imported revocations are never automatically restored.", ephemeral=True)
 
 
 @keys_group.command(name="user", description="Show all licenses belonging to a Discord customer")
 async def keys_user(interaction: discord.Interaction, customer: discord.Member):
-    if not interaction.guild or not isinstance(interaction.user, discord.Member):
-        return await interaction.response.send_message("Server only.", ephemeral=True)
-    if not is_staff(interaction.user):
-        return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
-    con = db(); rows = con.execute("SELECT * FROM licenses WHERE discord_user_id=? ORDER BY created_at DESC", (customer.id,)).fetchall(); con.close()
+    if not await require_license_staff(interaction):
+        return
+    with closing(db()) as con:
+        rows = con.execute("SELECT * FROM licenses WHERE discord_user_id=? ORDER BY created_at DESC", (customer.id,)).fetchall()
     if not rows:
         return await interaction.response.send_message(f"No licenses found for {customer.mention}.", ephemeral=True)
     lines = []
     for row in rows[:20]:
         exp = parse_iso(row["expires_at"])
-        masked = row["license_key"][:9] + "••••••" + row["license_key"][-4:]
+        ref = row["license_id"] or (row["license_key"][:9] + "••••••" + row["license_key"][-4:])
         expiry = "Permanent" if not exp else f"<t:{int(exp.timestamp())}:d>"
-        lines.append(f"• `{masked}` • **{row['tier'].title()}** • {license_status(row).title()} • {expiry}")
+        lines.append(f"• `{ref}` • **{row['tier'].title()}** • {license_status(row).title()} • {expiry}")
     await interaction.response.send_message(embed=quantix_embed(f"Licenses • {customer}", "\n".join(lines)), ephemeral=True)
 
 
@@ -1105,7 +1184,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
     if isinstance(error, app_commands.MissingPermissions):
         msg = "❌ You don't have permission to use that command."
     else:
-        msg = f"❌ Something went wrong: `{str(error)[:180]}`"
+        msg = "❌ The operation failed. Check configuration and database access; if a license was saved, retry with /key resend."
     try:
         if interaction.response.is_done():
             await interaction.followup.send(msg, ephemeral=True)
